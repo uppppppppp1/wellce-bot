@@ -1,8 +1,9 @@
+import os
 import random
 import logging
 from datetime import date
 from apscheduler.schedulers.blocking import BlockingScheduler
-from content import make_client, generate_post, generate_reply, generate_dm_reply
+from content import make_client, generate_dynamic_post, generate_reply, generate_dm_reply
 from poster import post_content, scrape_post_texts, reply_to_post, scrape_unread_dms, reply_to_dm
 from state import load_state, save_state, increment_post_count, mark_replied, mark_dm_replied, reset_daily
 
@@ -10,7 +11,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 POST_SCHEDULE = [
-    (9,  0,  "推荐",   "早晨"),
+    (17,  37,  "推荐",   "下班"),
     (12, 30, "蹲室友", "午间"),
     (20, 0,  "推荐",   "晚间"),
 ]
@@ -35,14 +36,16 @@ def job_post(section: str, time_slot: str):
 
     client = make_client()
     posted_topics = state.get("posted_topics", [])
-    text = generate_post(client, time_slot, section, posted_topics)
-    log.info(f"[POST] section={section}\n{text}")
+    post = generate_dynamic_post(client, time_slot, section, posted_topics)
+    title = post["title"]
+    body = post["body"]
+    log.info(f"[POST] section={section}\ntitle={title}\n{body}")
 
-    path = post_content(section, text)
+    path = post_content(section=section, text=body, title=title)
     log.info(f"[POST] Screenshot: {path}")
 
     state = increment_post_count(state)
-    state.setdefault("posted_topics", []).append(text[:20])
+    state.setdefault("posted_topics", []).append(f"{title}:{body[:20]}")
     save_state(state)
 
 
@@ -58,21 +61,20 @@ def job_scan_replies():
         return
 
     client = make_client()
-    for section in ["推荐", "蹲室友"]:
-        posts = scrape_post_texts(section, limit=20)
-        for post in posts:
-            if post["id"] in state["replied_ids"]:
-                continue
-            should_reply, reply_text = generate_reply(client, post["text"])
-            if not should_reply or not reply_text:
-                continue
-            log.info(f"[REPLY] post_id={post['id']}\nreply: {reply_text}")
-            reply_to_post(post["text"], reply_text)
-            state = mark_replied(state, post["id"])
-            save_state(state)
-            replied_today += 1
-            if replied_today >= MAX_REPLIES_PER_DAY:
-                return
+    posts = scrape_post_texts("首页", limit=5)
+    for post in posts:
+        if post["id"] in state["replied_ids"]:
+            continue
+        should_reply, reply_text = generate_reply(client, post["text"])
+        if not should_reply or not reply_text:
+            continue
+        log.info(f"[REPLY] post_id={post['id']}\npost={post['text']}\nreply={reply_text}")
+        reply_to_post(post["text"], reply_text)
+        state = mark_replied(state, post["id"])
+        save_state(state)
+        replied_today += 1
+        if replied_today >= MAX_REPLIES_PER_DAY:
+            return
 
 
 def job_scan_dms():
@@ -96,6 +98,8 @@ def job_scan_dms():
 
 def build_scheduler() -> BlockingScheduler:
     scheduler = BlockingScheduler()
+    enable_reply_scan = os.getenv("ENABLE_REPLY_SCAN", "false").lower() == "true"
+    enable_dm_scan = os.getenv("ENABLE_DM_SCAN", "false").lower() == "true"
 
     for hour, minute, section, time_slot in POST_SCHEDULE:
         jitter = _jitter_minutes()
@@ -111,7 +115,14 @@ def build_scheduler() -> BlockingScheduler:
         )
         log.info(f"Scheduled post: section={section} at {adj_hour:02d}:{adj_minute:02d}")
 
-    scheduler.add_job(job_scan_replies, "interval", minutes=30, id="scan_replies")
-    scheduler.add_job(job_scan_dms, "interval", hours=1, id="scan_dms")
+    if enable_reply_scan:
+        scheduler.add_job(job_scan_replies, "interval", minutes=30, id="scan_replies")
+    else:
+        log.info("Reply scan disabled. Set ENABLE_REPLY_SCAN=true to enable it.")
+
+    if enable_dm_scan:
+        scheduler.add_job(job_scan_dms, "interval", hours=1, id="scan_dms")
+    else:
+        log.info("DM scan disabled. Set ENABLE_DM_SCAN=true to enable it.")
 
     return scheduler

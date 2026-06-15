@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -23,6 +24,67 @@ def make_client() -> OpenAI:
         api_key=os.getenv("OPENAI_API_KEY"),
         base_url=os.getenv("OPENAI_BASE_URL"),
     )
+
+
+def _strip_json_fence(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return raw.strip()
+
+
+def _fallback_title(body: str, max_len: int = 24) -> str:
+    clean = re.sub(r"#\S+", "", body).strip()
+    first_line = clean.splitlines()[0].strip() if clean else ""
+    title = re.split(r"[。！？!?]", first_line)[0].strip() or "今天的小记录"
+    if len(title) > max_len:
+        title = title[:max_len].rstrip() + "..."
+    return title
+
+
+def generate_dynamic_post(client: OpenAI, time_slot: str, section: str, posted_topics: list[str]) -> dict:
+    topics_str = "、".join(posted_topics) if posted_topics else "无"
+    roommate_note = "如果写租房/室友相关，避免像中介广告，要像个人真实经验或观察。" if section == "蹲室友" else ""
+    user_prompt = f"""现在是{time_slot}，准备发一条 Wellcee 社区动态。
+今天已发的主题：{topics_str}。
+
+请以小林的身份生成一条真实自然的动态，适合 Wellcee 社区氛围。
+要求：
+- 标题 8-20 个中文字符，像真人随手写的标题，不要标题党
+- 正文 100-180 字，贴近上海打工人/租房/通勤/周末生活观察
+- 不要和今天已发内容重复
+- {roommate_note}
+- 正文结尾加 3-5 个相关 hashtag
+- 不要推广、不要政治、不要像营销号
+
+输出严格 JSON，不要解释：
+{{"title": "标题", "body": "正文"}}"""
+
+    resp = client.chat.completions.create(
+        model=os.getenv("MODEL_NAME", "gpt-4o"),
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.9,
+    )
+    raw = _strip_json_fence(resp.choices[0].message.content)
+    try:
+        data = json.loads(raw)
+        title = str(data.get("title", "")).strip()
+        body = str(data.get("body", "")).strip()
+    except json.JSONDecodeError:
+        body = raw
+        title = ""
+
+    if not body:
+        raise ValueError("AI returned an empty post body")
+    if not title:
+        title = _fallback_title(body)
+
+    return {"title": title[:30], "body": body}
 
 
 def generate_post(client: OpenAI, time_slot: str, section: str, posted_topics: list[str]) -> str:
@@ -63,7 +125,8 @@ def generate_reply(client: OpenAI, post_text: str) -> tuple[bool, str]:
 - 内容与上海生活完全无关
 
 如果适合回复，以小林身份写一条自然回复：
-- 30-60 字，口语化，有实质内容
+- 20-45 字，口语化，有实质内容
+- 不要加 hashtag，不要写成小作文
 - 如果帖子明显是外国用户发的（英文或混合语言），可以用简单英文回复
 
 输出格式（严格 JSON，不要其他内容）：
@@ -77,11 +140,7 @@ def generate_reply(client: OpenAI, post_text: str) -> tuple[bool, str]:
         ],
         temperature=0.7,
     )
-    raw = resp.choices[0].message.content.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
+    raw = _strip_json_fence(resp.choices[0].message.content)
     data = json.loads(raw)
     return data["should_reply"], data.get("reply", "")
 
