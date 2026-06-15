@@ -1,5 +1,4 @@
 .env
 state.json
-docs/
 __pycache__/
 *.pyc
